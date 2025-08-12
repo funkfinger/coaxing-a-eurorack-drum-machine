@@ -1,11 +1,14 @@
 /**
- * Eurorack Drum Machine - SD Card Sample Loading
+ * Eurorack Drum Machine - Flash Streaming Version
  *
  * Features:
- * - 4-voice polyphonic sample playback from SD card
+ * - 4-voice polyphonic sample playback with flash streaming
+ * - Samples stored in flash filesystem (1MB available)
+ * - Small RAM buffers for streaming (2KB per voice)
+ * - Much longer samples supported (up to 5+ seconds each)
+ * - SD card → Flash → Streaming playback workflow
  * - OLED display with sample status and navigation
  * - Button triggers for manual playback
- * - Sample selection and folder browsing
  * - I2S audio output via PCM5102A
  */
 
@@ -13,6 +16,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Arduino.h>
 #include <I2S.h>
+#include <LittleFS.h>
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -44,30 +48,41 @@
 #define BUTTON_3_PIN 8  // GPIO8 - Hihat
 #define BUTTON_4_PIN 9  // GPIO9 - Tom
 
-// Navigation buttons (optional - can use serial for now)
+// Navigation buttons
 #define NAV_UP_PIN 10      // GPIO10 - Navigate up
 #define NAV_DOWN_PIN 11    // GPIO11 - Navigate down
 #define NAV_SELECT_PIN 12  // GPIO12 - Select sample
 
 // Audio parameters
-#define SAMPLE_RATE 48000      // Match your 48kHz samples (was 16384)
-#define DEBOUNCE_DELAY 20      // 20ms debounce delay
-#define MAX_SAMPLE_SIZE 32768  // 32KB max per sample (~0.34 seconds at 48kHz)
+#define SAMPLE_RATE 48000        // Match your 48kHz samples
+#define DEBOUNCE_DELAY 20        // 20ms debounce delay
+#define STREAM_BUFFER_SIZE 2048  // 2KB streaming buffer per voice
+#define REFILL_THRESHOLD 512     // Refill when buffer has < 512 samples
+#define MAX_FLASH_SAMPLE_SIZE \
+  524288  // 512KB max per sample (~5.5 seconds at 48kHz)
 
-// Sample buffer structure for SD card samples
-struct SampleBuffer {
-  int16_t* data;
-  uint32_t length;
-  uint32_t position;
+// Flash-based streaming sample buffer
+struct StreamingSample {
+  int16_t* buffer;           // Small RAM buffer for streaming
+  uint32_t bufferSize;       // Size of RAM buffer (in samples)
+  uint32_t bufferHead;       // Current read position in buffer
+  uint32_t bufferTail;       // Current write position in buffer
+  uint32_t samplesInBuffer;  // Number of samples currently in buffer
+
+  File flashFile;          // Open file handle for streaming
+  uint32_t totalSamples;   // Total samples in flash file
+  uint32_t samplesPlayed;  // Samples played so far
+
   bool playing;
   bool loaded;
+  bool endOfFile;
   String filename;
-  String folder;
+  String flashPath;
 };
 
 // Sample player structure
 struct SamplePlayer {
-  SampleBuffer buffer;
+  StreamingSample stream;
   const char* folderName;
   int currentSampleIndex;
   int totalSamples;
@@ -76,10 +91,26 @@ struct SamplePlayer {
 
 // Initialize sample players for each drum type
 SamplePlayer samplePlayers[4] = {
-    {{nullptr, 0, 0, false, false, "", ""}, "kick", 0, 0, {}},
-    {{nullptr, 0, 0, false, false, "", ""}, "snare", 0, 0, {}},
-    {{nullptr, 0, 0, false, false, "", ""}, "hihat", 0, 0, {}},
-    {{nullptr, 0, 0, false, false, "", ""}, "tom", 0, 0, {}}};
+    {{nullptr, 0, 0, 0, 0, File(), 0, 0, false, false, false, "", ""},
+     "kick",
+     0,
+     0,
+     {}},
+    {{nullptr, 0, 0, 0, 0, File(), 0, 0, false, false, false, "", ""},
+     "snare",
+     0,
+     0,
+     {}},
+    {{nullptr, 0, 0, 0, 0, File(), 0, 0, false, false, false, "", ""},
+     "hihat",
+     0,
+     0,
+     {}},
+    {{nullptr, 0, 0, 0, 0, File(), 0, 0, false, false, false, "", ""},
+     "tom",
+     0,
+     0,
+     {}}};
 
 // Button state tracking
 struct ButtonState {
@@ -111,38 +142,47 @@ I2S i2s(OUTPUT, I2S_BCK_PIN, I2S_DATA_PIN);
 // Control variables
 bool oledWorking = false;
 bool sdCardWorking = false;
+bool flashWorking = false;
 int lastTriggeredSample = 0;
-int currentMenuSample = 0;  // For sample selection menu
+int currentMenuSample = 0;
 
 // Forward declarations
+void initializeFlash();
+void initializeStreamBuffers();
 void initializeSDCard();
 void scanSampleFolders();
-void loadSample(int playerIndex, int sampleIndex);
-void updateDisplay();
+void loadSampleToFlash(int playerIndex, int sampleIndex);
+void triggerSample(int sampleIndex);
+void refillStreamBuffer(int playerIndex);
+int16_t getNextSample(int playerIndex);
 void updateButtons();
 void processButtonTriggers();
-void triggerSample(int sampleIndex);
-bool loadWAVFile(const String& filepath, SampleBuffer& buffer);
+void updateDisplay();
+bool copyWAVToFlash(const String& sdPath, const String& flashPath);
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("=== Eurorack Drum Machine with SD Card ===");
+  Serial.println("=== Eurorack Drum Machine - Flash Streaming ===");
   Serial.printf("Sample Rate: %d Hz\n", SAMPLE_RATE);
-  Serial.printf("Max Sample Size: %d bytes\n", MAX_SAMPLE_SIZE);
+  Serial.printf("Stream Buffer Size: %d samples per voice\n",
+                STREAM_BUFFER_SIZE / 2);
+  Serial.printf("Max Flash Sample Size: %d bytes (~%.1f seconds)\n",
+                MAX_FLASH_SAMPLE_SIZE,
+                (float)MAX_FLASH_SAMPLE_SIZE / (SAMPLE_RATE * 2));
+  Serial.printf("Total RAM for streaming: %d bytes\n", 4 * STREAM_BUFFER_SIZE);
   Serial.println();
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  // Initialize button pins with internal pull-up resistors
+  // Initialize button pins
   for (int i = 0; i < 4; i++) {
     pinMode(buttons[i].pin, INPUT_PULLUP);
     Serial.printf("Initialized trigger button %d (%s) on GPIO%d\n", i + 1,
                   buttons[i].name, buttons[i].pin);
   }
 
-  // Initialize navigation buttons
   for (int i = 0; i < 3; i++) {
     pinMode(navButtons[i].pin, INPUT_PULLUP);
     Serial.printf("Initialized nav button %s on GPIO%d\n", navButtons[i].name,
@@ -166,16 +206,23 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println("Drum Machine");
-    display.println("SD Card Init...");
+    display.println("Flash Streaming");
+    display.println("Initializing...");
     display.display();
+    delay(1000);
   }
+
+  // Initialize Flash filesystem
+  initializeFlash();
+
+  // Initialize stream buffers
+  initializeStreamBuffers();
 
   // Initialize SD Card
   initializeSDCard();
 
-  // Initialize I2S with 16-bit samples
+  // Initialize I2S
   i2s.setBitsPerSample(16);
-
   if (!i2s.begin(SAMPLE_RATE)) {
     Serial.println("Failed to initialize I2S!");
     while (1) {
@@ -188,18 +235,17 @@ void setup() {
   Serial.println("Commands:");
   Serial.println("  1-4: Trigger samples");
   Serial.println("  u/d: Navigate samples");
-  Serial.println("  s: Select sample");
+  Serial.println("  s: Select sample (copy SD→Flash)");
   Serial.println("  l: List samples");
-  Serial.println("Ready!");
+  Serial.println("Flash streaming ready!");
 
-  // Update display with initial state
   if (oledWorking) {
     updateDisplay();
   }
 }
 
 void loop() {
-  // Process button inputs with debouncing
+  // Process button inputs
   updateButtons();
   processButtonTriggers();
 
@@ -230,12 +276,12 @@ void loop() {
         Serial.printf("Selected: %s\n",
                       samplePlayers[currentMenuSample].folderName);
         break;
-      case 's':  // Select next sample in current folder
+      case 's':  // Select sample (copy SD to Flash)
         if (samplePlayers[currentMenuSample].totalSamples > 0) {
           int nextIndex =
               (samplePlayers[currentMenuSample].currentSampleIndex + 1) %
               samplePlayers[currentMenuSample].totalSamples;
-          loadSample(currentMenuSample, nextIndex);
+          loadSampleToFlash(currentMenuSample, nextIndex);
         }
         break;
       case 'l':  // List samples
@@ -248,8 +294,6 @@ void loop() {
           }
         }
         break;
-      default:
-        break;
     }
   }
 
@@ -259,16 +303,9 @@ void loop() {
 
     // Mix all playing samples
     for (int j = 0; j < 4; j++) {
-      if (samplePlayers[j].buffer.playing && samplePlayers[j].buffer.loaded &&
-          samplePlayers[j].buffer.position < samplePlayers[j].buffer.length) {
-        // Read 16-bit sample and add to mix
-        int16_t sample =
-            samplePlayers[j].buffer.data[samplePlayers[j].buffer.position];
+      if (samplePlayers[j].stream.playing && samplePlayers[j].stream.loaded) {
+        int16_t sample = getNextSample(j);
         mixedSample += sample;
-        samplePlayers[j].buffer.position++;
-      } else if (samplePlayers[j].buffer.playing) {
-        // Sample finished playing
-        samplePlayers[j].buffer.playing = false;
       }
     }
 
@@ -277,6 +314,14 @@ void loop() {
 
     // Write stereo samples
     i2s.write16((int16_t)mixedSample, (int16_t)mixedSample);
+  }
+
+  // Refill stream buffers as needed
+  for (int i = 0; i < 4; i++) {
+    if (samplePlayers[i].stream.playing &&
+        samplePlayers[i].stream.samplesInBuffer < REFILL_THRESHOLD) {
+      refillStreamBuffer(i);
+    }
   }
 
   // Blink LED to show activity
@@ -296,7 +341,150 @@ void loop() {
   }
 }
 
-// Initialize SD Card and scan for samples
+// Initialize flash filesystem
+void initializeFlash() {
+  Serial.println("Initializing flash filesystem...");
+
+  if (!LittleFS.begin()) {
+    Serial.println("Flash filesystem initialization failed!");
+    flashWorking = false;
+    return;
+  }
+
+  Serial.println("Flash filesystem initialized successfully");
+  flashWorking = true;
+
+  // Create sample directories in flash
+  const char* dirs[] = {"/kick", "/snare", "/hihat", "/tom"};
+  for (int i = 0; i < 4; i++) {
+    if (!LittleFS.exists(dirs[i])) {
+      LittleFS.mkdir(dirs[i]);
+      Serial.printf("Created flash directory: %s\n", dirs[i]);
+    }
+  }
+}
+
+// Initialize stream buffers
+void initializeStreamBuffers() {
+  Serial.println("Initializing stream buffers...");
+
+  for (int i = 0; i < 4; i++) {
+    samplePlayers[i].stream.buffer = (int16_t*)malloc(STREAM_BUFFER_SIZE);
+    if (!samplePlayers[i].stream.buffer) {
+      Serial.printf("Failed to allocate stream buffer for %s\n",
+                    samplePlayers[i].folderName);
+      while (1) {
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        delay(100);
+      }
+    }
+
+    samplePlayers[i].stream.bufferSize =
+        STREAM_BUFFER_SIZE / 2;  // Convert bytes to samples
+    samplePlayers[i].stream.bufferHead = 0;
+    samplePlayers[i].stream.bufferTail = 0;
+    samplePlayers[i].stream.samplesInBuffer = 0;
+    samplePlayers[i].stream.totalSamples = 0;
+    samplePlayers[i].stream.samplesPlayed = 0;
+    samplePlayers[i].stream.playing = false;
+    samplePlayers[i].stream.loaded = false;
+    samplePlayers[i].stream.endOfFile = false;
+
+    Serial.printf("Allocated %d sample buffer for %s\n",
+                  samplePlayers[i].stream.bufferSize,
+                  samplePlayers[i].folderName);
+  }
+}
+
+// Trigger a sample to start playing
+void triggerSample(int sampleIndex) {
+  if (sampleIndex < 0 || sampleIndex >= 4) return;
+
+  if (samplePlayers[sampleIndex].stream.loaded) {
+    // Reset playback position
+    samplePlayers[sampleIndex].stream.samplesPlayed = 0;
+    samplePlayers[sampleIndex].stream.bufferHead = 0;
+    samplePlayers[sampleIndex].stream.samplesInBuffer = 0;
+    samplePlayers[sampleIndex].stream.endOfFile = false;
+    samplePlayers[sampleIndex].stream.playing = true;
+
+    // Reopen flash file for streaming
+    if (samplePlayers[sampleIndex].stream.flashFile) {
+      samplePlayers[sampleIndex].stream.flashFile.close();
+    }
+    samplePlayers[sampleIndex].stream.flashFile =
+        LittleFS.open(samplePlayers[sampleIndex].stream.flashPath, "r");
+
+    if (samplePlayers[sampleIndex].stream.flashFile) {
+      // Skip WAV header (44 bytes)
+      samplePlayers[sampleIndex].stream.flashFile.seek(44);
+
+      // Fill initial buffer
+      refillStreamBuffer(sampleIndex);
+
+      Serial.printf("Playing %s: %s\n", samplePlayers[sampleIndex].folderName,
+                    samplePlayers[sampleIndex].stream.filename.c_str());
+    } else {
+      Serial.printf("Failed to open flash file: %s\n",
+                    samplePlayers[sampleIndex].stream.flashPath.c_str());
+    }
+  } else {
+    Serial.printf("No sample loaded for %s\n",
+                  samplePlayers[sampleIndex].folderName);
+  }
+}
+
+// Get next sample from stream buffer
+int16_t getNextSample(int playerIndex) {
+  StreamingSample& stream = samplePlayers[playerIndex].stream;
+
+  if (!stream.playing || stream.samplesInBuffer == 0) {
+    return 0;
+  }
+
+  // Get sample from circular buffer
+  int16_t sample = stream.buffer[stream.bufferHead];
+  stream.bufferHead = (stream.bufferHead + 1) % stream.bufferSize;
+  stream.samplesInBuffer--;
+  stream.samplesPlayed++;
+
+  // Check if sample is finished
+  if (stream.samplesPlayed >= stream.totalSamples) {
+    stream.playing = false;
+    if (stream.flashFile) {
+      stream.flashFile.close();
+    }
+  }
+
+  return sample;
+}
+
+// Refill stream buffer from flash file
+void refillStreamBuffer(int playerIndex) {
+  StreamingSample& stream = samplePlayers[playerIndex].stream;
+
+  if (!stream.flashFile || stream.endOfFile) return;
+
+  // Fill buffer to capacity
+  while (stream.samplesInBuffer < stream.bufferSize && !stream.endOfFile) {
+    uint8_t bytes[2];
+    size_t bytesRead = stream.flashFile.read(bytes, 2);
+
+    if (bytesRead == 2) {
+      // Convert bytes to 16-bit sample (little-endian)
+      int16_t sample = (int16_t)(bytes[0] | (bytes[1] << 8));
+
+      // Add to circular buffer
+      stream.buffer[stream.bufferTail] = sample;
+      stream.bufferTail = (stream.bufferTail + 1) % stream.bufferSize;
+      stream.samplesInBuffer++;
+    } else {
+      stream.endOfFile = true;
+    }
+  }
+}
+
+// Initialize SD Card
 void initializeSDCard() {
   Serial.println("Initializing SD card...");
 
@@ -308,55 +496,32 @@ void initializeSDCard() {
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("SD card initialization failed!");
     sdCardWorking = false;
-
-    if (oledWorking) {
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println("SD Card Failed");
-      display.println("Using built-in");
-      display.println("samples");
-      display.display();
-      delay(2000);
-    }
     return;
   }
 
   Serial.println("SD card initialized successfully");
   sdCardWorking = true;
 
-  // Scan for sample folders and files
+  // Scan for sample folders
   scanSampleFolders();
-
-  // Load first sample from each folder
-  for (int i = 0; i < 4; i++) {
-    if (samplePlayers[i].totalSamples > 0) {
-      loadSample(i, 0);
-    }
-  }
 }
 
 // Scan SD card for sample folders and files
 void scanSampleFolders() {
+  if (!sdCardWorking) return;
+
   Serial.println("Scanning for sample folders...");
 
   for (int i = 0; i < 4; i++) {
     String folderPath = "/" + String(samplePlayers[i].folderName);
     File folder = SD.open(folderPath);
 
-    if (!folder) {
+    if (!folder || !folder.isDirectory()) {
       Serial.printf("Folder %s not found\n", folderPath.c_str());
       samplePlayers[i].totalSamples = 0;
       continue;
     }
 
-    if (!folder.isDirectory()) {
-      Serial.printf("%s is not a directory\n", folderPath.c_str());
-      folder.close();
-      samplePlayers[i].totalSamples = 0;
-      continue;
-    }
-
-    // Scan files in folder
     int sampleCount = 0;
     File file = folder.openNextFile();
 
@@ -364,7 +529,7 @@ void scanSampleFolders() {
       if (!file.isDirectory()) {
         String filename = file.name();
 
-        // Skip hidden files (starting with . or ._)
+        // Skip hidden files
         if (filename.startsWith(".")) {
           Serial.printf("Skipping hidden file: %s\n", filename.c_str());
           file.close();
@@ -385,185 +550,198 @@ void scanSampleFolders() {
       file = folder.openNextFile();
     }
 
-    folder.close();
     samplePlayers[i].totalSamples = sampleCount;
     Serial.printf("Folder %s: %d samples found\n", samplePlayers[i].folderName,
                   sampleCount);
+
+    folder.close();
   }
 }
 
-// Load a specific sample from SD card
-void loadSample(int playerIndex, int sampleIndex) {
+// Load sample from SD card to flash storage
+void loadSampleToFlash(int playerIndex, int sampleIndex) {
   if (playerIndex < 0 || playerIndex >= 4) return;
   if (sampleIndex < 0 || sampleIndex >= samplePlayers[playerIndex].totalSamples)
     return;
 
-  // Free existing sample data
-  if (samplePlayers[playerIndex].buffer.data != nullptr) {
-    Serial.printf("Freeing old sample memory (free heap before: %d bytes)\n",
-                  rp2040.getFreeHeap());
-    free(samplePlayers[playerIndex].buffer.data);
-    samplePlayers[playerIndex].buffer.data = nullptr;
-    samplePlayers[playerIndex].buffer.loaded = false;
-    Serial.printf("Memory freed (free heap after: %d bytes)\n",
-                  rp2040.getFreeHeap());
+  String filename = samplePlayers[playerIndex].sampleList[sampleIndex];
+  String sdPath =
+      "/" + String(samplePlayers[playerIndex].folderName) + "/" + filename;
+  String flashPath =
+      "/" + String(samplePlayers[playerIndex].folderName) + "/" + filename;
+
+  Serial.printf("Loading sample from SD to Flash: %s\n", sdPath.c_str());
+
+  // Close any existing flash file
+  if (samplePlayers[playerIndex].stream.flashFile) {
+    samplePlayers[playerIndex].stream.flashFile.close();
   }
 
-  // Build file path
-  String filepath = "/" + String(samplePlayers[playerIndex].folderName) + "/" +
-                    samplePlayers[playerIndex].sampleList[sampleIndex];
-
-  Serial.printf("Loading sample: %s\n", filepath.c_str());
-
-  // Load WAV file
-  if (loadWAVFile(filepath, samplePlayers[playerIndex].buffer)) {
+  // Copy WAV file from SD to flash
+  if (copyWAVToFlash(sdPath, flashPath)) {
+    samplePlayers[playerIndex].stream.flashPath = flashPath;
+    samplePlayers[playerIndex].stream.filename = filename;
+    samplePlayers[playerIndex].stream.loaded = true;
     samplePlayers[playerIndex].currentSampleIndex = sampleIndex;
-    samplePlayers[playerIndex].buffer.filename =
-        samplePlayers[playerIndex].sampleList[sampleIndex];
-    samplePlayers[playerIndex].buffer.folder =
-        samplePlayers[playerIndex].folderName;
-    Serial.printf("Loaded: %s (%d samples)\n", filepath.c_str(),
-                  samplePlayers[playerIndex].buffer.length);
+
+    Serial.printf("Sample loaded to flash: %s\n", filename.c_str());
+
+    // Get sample info from flash file
+    File flashFile = LittleFS.open(flashPath, "r");
+    if (flashFile) {
+      // Read WAV header to get sample count
+      flashFile.seek(40);  // Data size is at offset 40
+      uint32_t dataSize = 0;
+      flashFile.read((uint8_t*)&dataSize, 4);
+      samplePlayers[playerIndex].stream.totalSamples =
+          dataSize / 2;  // 16-bit samples
+      flashFile.close();
+
+      Serial.printf(
+          "Flash sample info: %d samples (%.2f seconds)\n",
+          samplePlayers[playerIndex].stream.totalSamples,
+          (float)samplePlayers[playerIndex].stream.totalSamples / SAMPLE_RATE);
+    }
   } else {
-    Serial.printf("Failed to load: %s\n", filepath.c_str());
+    Serial.printf("Failed to load sample: %s\n", filename.c_str());
   }
 }
 
-// Simple WAV file loader (assumes 16-bit mono/stereo WAV at any sample rate)
-bool loadWAVFile(const String& filepath, SampleBuffer& buffer) {
-  File file = SD.open(filepath);
-  if (!file) {
-    Serial.printf("Cannot open file: %s\n", filepath.c_str());
+// Copy WAV file from SD to flash with format conversion
+bool copyWAVToFlash(const String& sdPath, const String& flashPath) {
+  File sdFile = SD.open(sdPath);
+  if (!sdFile) {
+    Serial.printf("Failed to open SD file: %s\n", sdPath.c_str());
     return false;
   }
 
-  // Read WAV header (simplified - assumes standard format)
+  // Read WAV header
   uint8_t header[44];
-  if (file.read(header, 44) != 44) {
-    Serial.println("Cannot read WAV header");
-    file.close();
+  if (sdFile.read(header, 44) != 44) {
+    Serial.println("Failed to read WAV header");
+    sdFile.close();
     return false;
   }
 
-  // Check for RIFF and WAVE signatures
-  if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
-    Serial.println("Not a valid WAV file");
-    file.close();
-    return false;
-  }
-
-  // Extract audio format info
-  uint16_t audioFormat = *(uint16_t*)(header + 20);
-  uint16_t numChannels = *(uint16_t*)(header + 22);
+  // Parse WAV header
   uint32_t sampleRate = *(uint32_t*)(header + 24);
   uint16_t bitsPerSample = *(uint16_t*)(header + 34);
+  uint16_t numChannels = *(uint16_t*)(header + 22);
   uint32_t dataSize = *(uint32_t*)(header + 40);
 
   Serial.printf("WAV: %dHz, %d-bit, %d channels, %d bytes\n", sampleRate,
                 bitsPerSample, numChannels, dataSize);
 
-  // Support both 16-bit and 24-bit samples
-  if (bitsPerSample != 16 && bitsPerSample != 24) {
-    Serial.printf("Unsupported bit depth: %d-bit (need 16 or 24-bit)\n",
-                  bitsPerSample);
-    file.close();
+  // Check if sample is too large
+  if (dataSize > MAX_FLASH_SAMPLE_SIZE) {
+    Serial.printf("Sample too large: %d bytes (max %d)\n", dataSize,
+                  MAX_FLASH_SAMPLE_SIZE);
+    dataSize = MAX_FLASH_SAMPLE_SIZE;
+  }
+
+  // Create flash file
+  File flashFile = LittleFS.open(flashPath, "w");
+  if (!flashFile) {
+    Serial.printf("Failed to create flash file: %s\n", flashPath.c_str());
+    sdFile.close();
     return false;
   }
 
-  // Calculate number of samples
-  uint32_t numSamples = dataSize / (bitsPerSample / 8) / numChannels;
+  // Write modified WAV header (convert to 16-bit mono)
+  header[22] = 1;
+  header[23] = 0;  // 1 channel
+  header[34] = 16;
+  header[35] = 0;  // 16 bits per sample
+  uint32_t newDataSize = dataSize / (bitsPerSample / 8) / numChannels *
+                         2;  // Convert to 16-bit mono
+  *(uint32_t*)(header + 40) = newDataSize;
+  *(uint32_t*)(header + 4) = newDataSize + 36;  // File size
 
-  // Limit sample size
-  if (numSamples > MAX_SAMPLE_SIZE / 2) {
-    numSamples = MAX_SAMPLE_SIZE / 2;
-    Serial.printf("Sample truncated to %d samples\n", numSamples);
-  }
+  flashFile.write(header, 44);
 
-  // Allocate memory for sample data
-  uint32_t bytesNeeded = numSamples * sizeof(int16_t);
-  buffer.data = (int16_t*)malloc(bytesNeeded);
-  if (!buffer.data) {
-    Serial.printf("Cannot allocate %d bytes for sample (free heap: %d bytes)\n",
-                  bytesNeeded, rp2040.getFreeHeap());
-    file.close();
-    return false;
-  }
+  // Copy and convert audio data
+  uint32_t samplesProcessed = 0;
+  uint32_t totalSamples = dataSize / (bitsPerSample / 8) / numChannels;
 
-  Serial.printf("Allocated %d bytes for sample (free heap: %d bytes)\n",
-                bytesNeeded, rp2040.getFreeHeap());
+  while (samplesProcessed < totalSamples && sdFile.available()) {
+    int16_t outputSample = 0;
 
-  // Read sample data
-  for (uint32_t i = 0; i < numSamples; i++) {
     if (bitsPerSample == 16) {
-      // 16-bit samples
       if (numChannels == 1) {
-        // Mono
-        int16_t sample;
-        if (file.read((uint8_t*)&sample, 2) != 2) break;
-        buffer.data[i] = sample;
+        // 16-bit mono - direct copy
+        uint8_t bytes[2];
+        if (sdFile.read(bytes, 2) == 2) {
+          outputSample = (int16_t)(bytes[0] | (bytes[1] << 8));
+        }
       } else {
-        // Stereo - mix to mono
-        int16_t left, right;
-        if (file.read((uint8_t*)&left, 2) != 2) break;
-        if (file.read((uint8_t*)&right, 2) != 2) break;
-        buffer.data[i] = (left + right) / 2;
+        // 16-bit stereo - mix to mono
+        uint8_t bytes[4];
+        if (sdFile.read(bytes, 4) == 4) {
+          int16_t left = (int16_t)(bytes[0] | (bytes[1] << 8));
+          int16_t right = (int16_t)(bytes[2] | (bytes[3] << 8));
+          outputSample = (left + right) / 2;
+        }
       }
     } else if (bitsPerSample == 24) {
-      // 24-bit samples - convert to 16-bit
       if (numChannels == 1) {
-        // Mono 24-bit
+        // 24-bit mono - convert to 16-bit
         uint8_t bytes[3];
-        if (file.read(bytes, 3) != 3) break;
-        int32_t sample24 = (bytes[2] << 16) | (bytes[1] << 8) | bytes[0];
-        if (sample24 & 0x800000) sample24 |= 0xFF000000;  // Sign extend
-        buffer.data[i] = sample24 >> 8;                   // Convert to 16-bit
+        if (sdFile.read(bytes, 3) == 3) {
+          int32_t sample24 =
+              (int32_t)(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16));
+          if (sample24 & 0x800000) sample24 |= 0xFF000000;  // Sign extend
+          outputSample = sample24 >> 8;
+        }
       } else {
-        // Stereo 24-bit - mix to mono
-        uint8_t leftBytes[3], rightBytes[3];
-        if (file.read(leftBytes, 3) != 3) break;
-        if (file.read(rightBytes, 3) != 3) break;
-
-        int32_t left24 =
-            (leftBytes[2] << 16) | (leftBytes[1] << 8) | leftBytes[0];
-        int32_t right24 =
-            (rightBytes[2] << 16) | (rightBytes[1] << 8) | rightBytes[0];
-
-        if (left24 & 0x800000) left24 |= 0xFF000000;    // Sign extend
-        if (right24 & 0x800000) right24 |= 0xFF000000;  // Sign extend
-
-        int32_t mixed = (left24 + right24) / 2;
-        buffer.data[i] = mixed >> 8;  // Convert to 16-bit
+        // 24-bit stereo - mix to mono and convert to 16-bit
+        uint8_t bytes[6];
+        if (sdFile.read(bytes, 6) == 6) {
+          int32_t left24 =
+              (int32_t)(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16));
+          int32_t right24 =
+              (int32_t)(bytes[3] | (bytes[4] << 8) | (bytes[5] << 16));
+          if (left24 & 0x800000) left24 |= 0xFF000000;
+          if (right24 & 0x800000) right24 |= 0xFF000000;
+          int32_t mixed = (left24 + right24) / 2;
+          outputSample = mixed >> 8;
+        }
       }
     }
+
+    // Write 16-bit sample to flash
+    uint8_t outputBytes[2] = {(uint8_t)(outputSample & 0xFF),
+                              (uint8_t)(outputSample >> 8)};
+    flashFile.write(outputBytes, 2);
+
+    samplesProcessed++;
   }
 
-  file.close();
+  sdFile.close();
+  flashFile.close();
 
-  buffer.length = numSamples;
-  buffer.position = 0;
-  buffer.playing = false;
-  buffer.loaded = true;
-
+  Serial.printf("Copied %d samples to flash: %s\n", samplesProcessed,
+                flashPath.c_str());
   return true;
 }
 
-// Button debouncing and trigger detection
+// Update button states with debouncing
 void updateButtons() {
-  // Process trigger buttons
+  unsigned long currentTime = millis();
+
+  // Update trigger buttons
   for (int i = 0; i < 4; i++) {
-    int reading = digitalRead(buttons[i].pin);
+    bool reading = digitalRead(buttons[i].pin) == LOW;  // Active low
 
     if (reading != buttons[i].lastState) {
-      buttons[i].lastDebounceTime = millis();
+      buttons[i].lastDebounceTime = currentTime;
     }
 
-    if ((millis() - buttons[i].lastDebounceTime) > DEBOUNCE_DELAY) {
+    if ((currentTime - buttons[i].lastDebounceTime) > DEBOUNCE_DELAY) {
       if (reading != buttons[i].currentState) {
         buttons[i].currentState = reading;
 
-        if (buttons[i].currentState == LOW) {
+        if (buttons[i].currentState) {
           buttons[i].triggered = true;
-          Serial.printf("Button %d (%s) triggered!\n", i + 1, buttons[i].name);
         }
       }
     }
@@ -571,21 +749,20 @@ void updateButtons() {
     buttons[i].lastState = reading;
   }
 
-  // Process navigation buttons
+  // Update navigation buttons
   for (int i = 0; i < 3; i++) {
-    int reading = digitalRead(navButtons[i].pin);
+    bool reading = digitalRead(navButtons[i].pin) == LOW;  // Active low
 
     if (reading != navButtons[i].lastState) {
-      navButtons[i].lastDebounceTime = millis();
+      navButtons[i].lastDebounceTime = currentTime;
     }
 
-    if ((millis() - navButtons[i].lastDebounceTime) > DEBOUNCE_DELAY) {
+    if ((currentTime - navButtons[i].lastDebounceTime) > DEBOUNCE_DELAY) {
       if (reading != navButtons[i].currentState) {
         navButtons[i].currentState = reading;
 
-        if (navButtons[i].currentState == LOW) {
+        if (navButtons[i].currentState) {
           navButtons[i].triggered = true;
-          Serial.printf("Nav button %s triggered!\n", navButtons[i].name);
         }
       }
     }
@@ -600,7 +777,9 @@ void processButtonTriggers() {
   for (int i = 0; i < 4; i++) {
     if (buttons[i].triggered) {
       buttons[i].triggered = false;
+      Serial.printf("Button %d (%s) triggered!\n", i + 1, buttons[i].name);
       triggerSample(i);
+      lastTriggeredSample = i;
     }
   }
 
@@ -625,29 +804,12 @@ void processButtonTriggers() {
       int nextIndex =
           (samplePlayers[currentMenuSample].currentSampleIndex + 1) %
           samplePlayers[currentMenuSample].totalSamples;
-      loadSample(currentMenuSample, nextIndex);
+      loadSampleToFlash(currentMenuSample, nextIndex);
     }
   }
 }
 
-// Trigger a specific sample
-void triggerSample(int sampleIndex) {
-  if (sampleIndex >= 0 && sampleIndex < 4) {
-    if (samplePlayers[sampleIndex].buffer.loaded) {
-      samplePlayers[sampleIndex].buffer.position = 0;
-      samplePlayers[sampleIndex].buffer.playing = true;
-      lastTriggeredSample = sampleIndex;
-
-      Serial.printf("Playing %s: %s\n", samplePlayers[sampleIndex].folderName,
-                    samplePlayers[sampleIndex].buffer.filename.c_str());
-    } else {
-      Serial.printf("No sample loaded for %s\n",
-                    samplePlayers[sampleIndex].folderName);
-    }
-  }
-}
-
-// Display functions
+// Update OLED display
 void updateDisplay() {
   if (!oledWorking) return;
 
@@ -656,47 +818,30 @@ void updateDisplay() {
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
 
-  if (!sdCardWorking) {
-    display.println("SD Card Error");
-    display.println("Check wiring");
-    display.display();
-    return;
-  }
-
   // Title
-  display.println("Drum Machine");
+  display.println("Flash Streaming");
 
-  // Show currently selected sample type
-  display.printf("Sel: %s\n", samplePlayers[currentMenuSample].folderName);
+  // Show current sample info
+  if (samplePlayers[currentMenuSample].stream.loaded) {
+    display.printf("%s: %s\n", samplePlayers[currentMenuSample].folderName,
+                   samplePlayers[currentMenuSample].stream.filename.c_str());
 
-  // Show playing samples or current sample info
-  bool anyPlaying = false;
-  for (int i = 0; i < 4; i++) {
-    if (samplePlayers[i].buffer.playing) {
-      anyPlaying = true;
-      break;
-    }
-  }
+    float duration =
+        (float)samplePlayers[currentMenuSample].stream.totalSamples /
+        SAMPLE_RATE;
+    display.printf("%.1fs", duration);
 
-  if (anyPlaying) {
-    display.print("Playing: ");
-    for (int i = 0; i < 4; i++) {
-      if (samplePlayers[i].buffer.playing) {
-        display.printf("%c", samplePlayers[i].folderName[0]);  // First letter
-      }
+    if (samplePlayers[currentMenuSample].stream.playing) {
+      display.print(" PLAYING");
     }
   } else {
-    // Show current sample for selected type
-    if (samplePlayers[currentMenuSample].buffer.loaded) {
-      String shortName = samplePlayers[currentMenuSample].buffer.filename;
-      if (shortName.length() > 10) {
-        shortName = shortName.substring(0, 10) + "...";
-      }
-      display.printf("Cur: %s", shortName.c_str());
-    } else {
-      display.print("No samples");
-    }
+    display.printf("%s: No sample",
+                   samplePlayers[currentMenuSample].folderName);
   }
+
+  // Show memory usage
+  display.setCursor(0, 24);
+  display.printf("Free: %dKB", rp2040.getFreeHeap() / 1024);
 
   display.display();
 }
