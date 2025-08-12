@@ -50,9 +50,9 @@
 #define NAV_SELECT_PIN 12  // GPIO12 - Select sample
 
 // Audio parameters
-#define SAMPLE_RATE 48000       // Match your 48kHz samples (was 16384)
-#define DEBOUNCE_DELAY 20       // 20ms debounce delay
-#define MAX_SAMPLE_SIZE 196608  // 192KB max per sample (~2 seconds at 48kHz)
+#define SAMPLE_RATE 48000      // Match your 48kHz samples (was 16384)
+#define DEBOUNCE_DELAY 20      // 20ms debounce delay
+#define MAX_SAMPLE_SIZE 32768  // 32KB max per sample (~0.34 seconds at 48kHz)
 
 // Sample buffer structure for SD card samples
 struct SampleBuffer {
@@ -400,8 +400,13 @@ void loadSample(int playerIndex, int sampleIndex) {
 
   // Free existing sample data
   if (samplePlayers[playerIndex].buffer.data != nullptr) {
+    Serial.printf("Freeing old sample memory (free heap before: %d bytes)\n",
+                  rp2040.getFreeHeap());
     free(samplePlayers[playerIndex].buffer.data);
     samplePlayers[playerIndex].buffer.data = nullptr;
+    samplePlayers[playerIndex].buffer.loaded = false;
+    Serial.printf("Memory freed (free heap after: %d bytes)\n",
+                  rp2040.getFreeHeap());
   }
 
   // Build file path
@@ -475,12 +480,17 @@ bool loadWAVFile(const String& filepath, SampleBuffer& buffer) {
   }
 
   // Allocate memory for sample data
-  buffer.data = (int16_t*)malloc(numSamples * sizeof(int16_t));
+  uint32_t bytesNeeded = numSamples * sizeof(int16_t);
+  buffer.data = (int16_t*)malloc(bytesNeeded);
   if (!buffer.data) {
-    Serial.println("Cannot allocate memory for sample");
+    Serial.printf("Cannot allocate %d bytes for sample (free heap: %d bytes)\n",
+                  bytesNeeded, rp2040.getFreeHeap());
     file.close();
     return false;
   }
+
+  Serial.printf("Allocated %d bytes for sample (free heap: %d bytes)\n",
+                bytesNeeded, rp2040.getFreeHeap());
 
   // Read sample data
   for (uint32_t i = 0; i < numSamples; i++) {
