@@ -1,0 +1,49 @@
+# Archive folder (old test code)
+archive/
+
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+firmware/lib/
+firmware/test/
+
+# Build artifacts
+*.elf
+*.bin
+*.hex
+*.uf2
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node.js (if using any web tools)
+node_modules/
+npm-debug.log*
+
+# Archives and backups
+*.zip
+*.tar.gz
+*.bak
+*.backup

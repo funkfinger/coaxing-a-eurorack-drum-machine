@@ -1,0 +1,32 @@
+Category,Component,Part Number,Description,Quantity,Unit Price,Total Price,Supplier,Notes
+Core MCU,Raspberry Pi Pico,Raspberry Pi Pico,RP2040 dual-core MCU board,1,$4.00,$4.00,Adafruit/Mouser,Main controller
+Audio,PCM5102A Module,PCM5102A,24-bit I2S DAC breakout board,1,$10.00,$10.00,Amazon/AliExpress,Audio output DAC
+Display,SSD1306 OLED,SSD1306 128x64,0.96" OLED display module I2C,1,$6.00,$6.00,Adafruit/Amazon,User interface display
+Storage,MicroSD Module,Generic,MicroSD card breakout SPI,1,$3.00,$3.00,Amazon/SparkFun,Sample storage
+Storage,MicroSD Card,SanDisk 32GB,Class 10 microSD card,1,$8.00,$8.00,Amazon,Audio sample storage
+Interface,Rotary Encoder,PEC11R-4215F-S0024,Incremental encoder with switch,1,$4.00,$4.00,Mouser,Navigation control
+Interface,Tactile Switches,B3F-4055,6mm tactile switches,4,$1.50,$6.00,Mouser,Trigger buttons
+Eurorack,Power Header,2x8 IDC Header,16-pin shrouded header,1,$2.00,$2.00,Mouser,Eurorack power connection
+Eurorack,Audio Jack,PJ301M-12,3.5mm mono jack,1,$1.50,$1.50,Thonk,Audio output
+Eurorack,CV Input Jacks,PJ301M-12,3.5mm mono jacks,5,$1.50,$7.50,Thonk,CV trigger inputs
+Op-Amps,Quad Op-Amp,TL074CN,Low-noise JFET op-amp,2,$1.00,$2.00,Mouser,Signal conditioning
+Resistors,10k Resistors,CFR-25JB-52-10K,1/4W 1% metal film,10,$0.10,$1.00,Mouser,Voltage dividers
+Resistors,20k Resistors,CFR-25JB-52-20K,1/4W 1% metal film,5,$0.10,$0.50,Mouser,Voltage dividers
+Resistors,3.3k Resistors,CFR-25JB-52-3K3,1/4W 1% metal film,5,$0.10,$0.50,Mouser,Gain setting
+Capacitors,100nF Ceramic,C315C104M5U5TA,100nF 50V ceramic,20,$0.20,$4.00,Mouser,Bypass capacitors
+Capacitors,10uF Electrolytic,ECA-1HM100,10uF 50V electrolytic,10,$0.30,$3.00,Mouser,Power filtering
+Capacitors,100uF Electrolytic,ECA-1HM101,100uF 50V electrolytic,5,$0.50,$2.50,Mouser,Bulk capacitance
+Protection,3.3V Zener Diodes,1N5226B,3.3V 500mW Zener,5,$0.25,$1.25,Mouser,Overvoltage protection
+Protection,TVS Diodes,SMAJ5.0A,5V TVS diode,5,$0.50,$2.50,Mouser,ESD protection
+Regulation,3.3V Regulator,AMS1117-3.3,800mA LDO regulator,1,$1.00,$1.00,LCSC,Power regulation
+Mechanical,Front Panel,Custom,8HP aluminum panel,1,$25.00,$25.00,Front Panel Express,Eurorack front panel
+Mechanical,PCB,Custom,Main circuit board,1,$15.00,$15.00,JLCPCB,Custom PCB
+Mechanical,Standoffs,M3x10mm,PCB mounting standoffs,4,$0.50,$2.00,McMaster,PCB mounting
+Mechanical,Screws,M3x6mm,Panel mounting screws,4,$0.25,$1.00,McMaster,Panel mounting
+Mechanical,Knobs,Davies 1900h,Rotary encoder knobs,1,$3.00,$3.00,Mouser,User interface
+Mechanical,Button Caps,Generic,Tactile switch caps,4,$0.50,$2.00,Amazon,Button identification
+Wire,Ribbon Cable,16-pin IDC,Eurorack power cable,1,$5.00,$5.00,Mouser,Power connection
+Wire,Hookup Wire,22 AWG,Stranded hookup wire,1,$10.00,$10.00,Mouser,Internal connections
+Misc,IC Sockets,DIP-14,14-pin IC sockets,2,$0.50,$1.00,Mouser,Op-amp sockets
+Misc,Headers,2.54mm,Pin headers for connections,1,$2.00,$2.00,Mouser,Programming/debug
+,,,,TOTAL:,,$134.25,,
